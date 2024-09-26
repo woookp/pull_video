@@ -4,20 +4,17 @@ from datetime import datetime
 import os
 import subprocess
 
-# 拉流摄像头
-video_capture = cv2.VideoCapture(0)  # 调用摄像头的 RTSP 协议流
+video_capture = cv2.VideoCapture(2)
 
-# 推流 URL 地址
 push_url = "rtsp://192.168.78.200:8554/stream"
 
-# 获取摄像头的宽度、高度和帧率
-width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+width = 1280  # 720p宽度
+height = 720  # 720p高度
 fps = int(video_capture.get(cv2.CAP_PROP_FPS))
 print("width:", width, "height:", height, "fps:", fps)
 
-# FFmpeg 推流命令
-command = [
+def start_stream(current_fps):
+    command = [
     'ffmpeg',
     '-y',
     '-an',
@@ -25,52 +22,85 @@ command = [
     '-vcodec', 'rawvideo',
     '-pix_fmt', 'bgr24',
     '-s', "{}x{}".format(width, height),
-    '-r', str(fps),
+    '-r', str(current_fps),
     '-i', '-',
     '-c:v', 'libx264',
-    '-pix_fmt', 'yuv420p',
     '-preset', 'ultrafast',
     '-tune', 'zerolatency',
-    '-max_delay', '0',
-    '-bufsize', '100k',
+    '-crf', '28',
     '-f', 'rtsp',
     '-rtsp_transport', 'tcp',
+    '-buffer_size', '1M',
+    '-max_delay', '200000',
     push_url
-]
-pipe = subprocess.Popen(command, shell=False, stdin=subprocess.PIPE)
+    ]
+    return subprocess.Popen(command, shell=False, stdin=subprocess.PIPE)
 
-def frame_handler(frame):
-    # 运行目标追踪等处理
-    return frame
+pipe = start_stream(fps)
 
-# 创建 VideoWriter 对象以保存本地视频
-current_time1 = datetime.now().strftime("%Y%m%d_%H%M%S")
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 output_directory = './results_video/only_video_results/'
 os.makedirs(output_directory, exist_ok=True)
-out_video = cv2.VideoWriter(os.path.join(output_directory, f'{current_time1}_raw_img.mp4'), fourcc, fps, (width, height))
+out_video = cv2.VideoWriter(os.path.join(output_directory, f'{current_time}_raw_img.mp4'), fourcc, fps, (width, height))
+
+retry_count = 0
+max_retries = 100
+retry_delay = 2
 
 while True:
-    # 读取视频帧
     ret, frame = video_capture.read()
     if not ret:
         break
 
-    # 处理视频帧
-    frame = frame_handler(frame)
-
-    # 保存本地视频
     out_video.write(frame)
 
-    # 推送帧到 RTSP 流
-    pipe.stdin.write(frame.tobytes())
+    current_fps = fps if retry_count == 0 else max(5, fps-10 - retry_count)
 
-    # 键盘输入 'q' 退出
-    if  0xFF == ord('q'):
+    retry_count = 0  # 在每一帧开始时重置重试计数
+    while True:
+        try:
+            pipe.stdin.write(frame.tobytes())
+            pipe.stdin.flush()  # 确保数据立即写入
+            break  # 成功写入后跳出内层循环
+        except (BrokenPipeError, OSError) as e:
+            print(f"Error: {e}. Restarting stream...")
+            pipe.terminate()  # 终止现有流
+            pipe.wait()  # 等待子进程结束
+            time.sleep(retry_delay)  # 等待重试
+            
+            # 尝试重新启动流
+            retry_count += 1
+            pipe = start_stream(current_fps)
+
+            # 检查连接是否成功
+            if pipe.poll() is not None:  # 如果进程已结束
+                print("Stream initialization failed. Retrying...")
+                time.sleep(retry_delay)  # 等待重试
+            
+            # 重新读取并写入当前帧
+            ret, frame = video_capture.read()
+            if ret:
+                out_video.write(frame)
+                try:
+                    pipe.stdin.write(frame.tobytes())  # 尝试写入当前帧
+                    pipe.stdin.flush()
+                except Exception as e:
+                    print(f"Failed to write frame after reconnecting: {e}")
+
+            # 如果达到最大重试次数，退出程序
+            if retry_count >= max_retries:
+                print("Max retries reached. Exiting...")
+                video_capture.release()
+                out_video.release()
+                cv2.destroyAllWindows()
+                exit(1)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# 释放资源
 video_capture.release()
 out_video.release()
 cv2.destroyAllWindows()
 pipe.terminate()
+
