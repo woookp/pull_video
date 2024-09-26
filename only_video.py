@@ -8,7 +8,7 @@ import subprocess
 video_capture = cv2.VideoCapture(0)  # 调用摄像头的 RTSP 协议流
 
 # 推流 URL 地址
-push_url = "rtsp://192.168.1.121:8554/stream"
+push_url = "rtsp://192.168.78.200:8554/stream"
 
 # 获取摄像头的宽度、高度和帧率
 width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))

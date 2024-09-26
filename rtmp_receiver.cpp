@@ -1,5 +1,8 @@
 #include <iostream>
 #include <string>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -10,19 +13,34 @@ extern "C" {
 
 #include <SDL2/SDL.h>
 
+std::mutex frameMutex;
+std::deque<AVFrame*> frameQueue;  // 存储解码成功的帧
+const size_t MAX_FRAMES = 10;  // 设置最大帧数
+
+void cleanup_frame(AVFrame* frame) {
+    if (frame) {
+        av_frame_free(&frame);
+    }
+}
+
 int main() {
     // 初始化 FFmpeg
     av_register_all();
     avformat_network_init();
 
-    const char* rtspurl = "rtsp://192.168.1.222:8554/stream";
+    const char* rtspurl = "rtsp://192.168.78.200:8554/stream"; // 不加 ?tcp
+
+    // 设置RTSP选项，使用TCP传输
+    AVDictionary* options = NULL;
+    av_dict_set(&options, "rtsp_transport", "tcp", 0);
 
     // 打开 RTSP 流
     AVFormatContext* formatContext = avformat_alloc_context();
-    if (avformat_open_input(&formatContext, rtspurl, NULL, NULL) != 0) {
+    if (avformat_open_input(&formatContext, rtspurl, NULL, &options) != 0) {
         std::cerr << "Error: Couldn't open the RTSP stream." << std::endl;
         return -1;
     }
+    av_dict_free(&options);  // 释放选项
 
     if (avformat_find_stream_info(formatContext, NULL) < 0) {
         std::cerr << "Error: Couldn't find stream information." << std::endl;
@@ -84,7 +102,6 @@ int main() {
         codecContext->width, codecContext->height, AV_PIX_FMT_RGB24,
         SWS_BILINEAR, NULL, NULL, NULL);
 
-    // 创建用于存储解码帧的 AVFrame
     AVFrame* frame = av_frame_alloc();
     AVFrame* rgbFrame = av_frame_alloc();
     int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, codecContext->width, codecContext->height, 1);
@@ -95,6 +112,31 @@ int main() {
     bool quit = false;
     SDL_Event event;
 
+    // 创建一个线程用于解码
+    std::thread decodeThread([&]() {
+        while (!quit) {
+            if (av_read_frame(formatContext, &packet) >= 0) {
+                if (packet.stream_index == videoStream) {
+                    // 发送数据包到解码器
+                    if (avcodec_send_packet(codecContext, &packet) == 0) {
+                        while (avcodec_receive_frame(codecContext, frame) == 0) {
+                            std::lock_guard<std::mutex> lock(frameMutex);
+                            // 限制帧队列的大小
+                            if (frameQueue.size() >= MAX_FRAMES) {
+                                cleanup_frame(frameQueue.front());
+                                frameQueue.pop_front();
+                            }
+                            frameQueue.push_back(av_frame_clone(frame));  // 存储成功解码的帧
+                        }
+                    }
+                }
+                av_packet_unref(&packet);
+            } else {
+                SDL_Delay(10);  // 暂停一小段时间
+            }
+        }
+    });
+
     while (!quit) {
         // 处理 SDL 事件
         while (SDL_PollEvent(&event)) {
@@ -103,31 +145,25 @@ int main() {
             }
         }
 
-        // 读取一帧
-        if (av_read_frame(formatContext, &packet) >= 0) {
-            if (packet.stream_index == videoStream) {
-                // 发送数据包到解码器
-                if (avcodec_send_packet(codecContext, &packet) == 0) {
-                    // 接收解码后的帧
-                    while (avcodec_receive_frame(codecContext, frame) == 0) {
-                        // 将解码后的帧转换为 RGB 格式
-                        sws_scale(swsContext, frame->data, frame->linesize, 0, codecContext->height, rgbFrame->data, rgbFrame->linesize);
+        std::lock_guard<std::mutex> lock(frameMutex);
+        if (!frameQueue.empty()) {
+            AVFrame* currentFrame = frameQueue.front();
+            frameQueue.pop_front();
 
-                        // 更新 SDL 纹理
-                        SDL_UpdateTexture(texture, NULL, rgbFrame->data[0], rgbFrame->linesize[0]);
+            // 将解码后的帧转换为 RGB 格式
+            sws_scale(swsContext, currentFrame->data, currentFrame->linesize, 0, codecContext->height, rgbFrame->data, rgbFrame->linesize);
 
-                        // 清除渲染器并绘制纹理
-                        SDL_RenderClear(renderer);
-                        SDL_RenderCopy(renderer, texture, NULL, NULL);
-                        SDL_RenderPresent(renderer);
-                    }
-                }
-                av_packet_unref(&packet);
-            }
-        }
-        else {
-            std::cerr << "Warning: Failed to read frame. Retrying..." << std::endl;
-            SDL_Delay(10);
+            // 更新 SDL 纹理
+            SDL_UpdateTexture(texture, NULL, rgbFrame->data[0], rgbFrame->linesize[0]);
+
+            // 清除渲染器并绘制纹理
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, NULL, NULL);
+            SDL_RenderPresent(renderer);
+
+            cleanup_frame(currentFrame);  // 清理当前帧
+        } else {
+            SDL_Delay(10);  // 暂停一小段时间
         }
     }
 
@@ -138,6 +174,7 @@ int main() {
     avcodec_free_context(&codecContext);
     avformat_close_input(&formatContext);
     sws_freeContext(swsContext);
+    decodeThread.join();  // 等待解码线程结束
 
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
