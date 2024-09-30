@@ -8,8 +8,8 @@ video_capture = cv2.VideoCapture(2)
 
 push_url = "rtsp://192.168.78.200:8554/stream"
 
-width = 1280  # 720p宽度
-height = 720  # 720p高度
+width = 640  # 720p宽度
+height = 480  # 720p高度
 fps = int(video_capture.get(cv2.CAP_PROP_FPS))
 print("width:", width, "height:", height, "fps:", fps)
 
