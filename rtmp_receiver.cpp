@@ -2,6 +2,7 @@
 #include <string>
 #include <deque>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 
 extern "C" {
@@ -14,8 +15,11 @@ extern "C" {
 #include <SDL2/SDL.h>
 
 std::mutex frameMutex;
-std::deque<AVFrame*> frameQueue;  // ´æ´¢½âÂë³É¹¦µÄÖ¡
-const size_t MAX_FRAMES = 10;  // ÉèÖÃ×î´óÖ¡Êı
+std::condition_variable frameCondVar;
+std::deque<AVFrame*> frameQueue;
+bool frameReady = false;
+bool quit = false;
+const size_t MAX_FRAMES = 1;
 
 void cleanup_frame(AVFrame* frame) {
     if (frame) {
@@ -23,31 +27,46 @@ void cleanup_frame(AVFrame* frame) {
     }
 }
 
-int main() {
-    // ³õÊ¼»¯ FFmpeg
-    av_register_all();
-    avformat_network_init();
+// æ¸…ç©ºå¸§é˜Ÿåˆ—çš„å‡½æ•°
+void clear_frame_queue() {
+    std::lock_guard<std::mutex> lock(frameMutex);
+    while (!frameQueue.empty()) {
+        cleanup_frame(frameQueue.front());
+        frameQueue.pop_front();
+    }
+}
 
-    const char* rtspurl = "rtsp://192.168.78.200:8554/stream"; // ²»¼Ó ?tcp
-
-    // ÉèÖÃRTSPÑ¡Ïî£¬Ê¹ÓÃTCP´«Êä
+// æ‰“å¼€RTSPæµçš„å°è£…å‡½æ•°
+int open_rtsp_stream(AVFormatContext** formatContext, const char* rtspurl) {
     AVDictionary* options = NULL;
-    av_dict_set(&options, "rtsp_transport", "tcp", 0);
+    av_dict_set(&options, "rtsp_transport", "tcp", 0);  // ä½¿ç”¨TCPä¼ è¾“
 
-    // ´ò¿ª RTSP Á÷
-    AVFormatContext* formatContext = avformat_alloc_context();
-    if (avformat_open_input(&formatContext, rtspurl, NULL, &options) != 0) {
+    if (avformat_open_input(formatContext, rtspurl, NULL, &options) != 0) {
         std::cerr << "Error: Couldn't open the RTSP stream." << std::endl;
+        av_dict_free(&options);
         return -1;
     }
-    av_dict_free(&options);  // ÊÍ·ÅÑ¡Ïî
+    av_dict_free(&options);
 
-    if (avformat_find_stream_info(formatContext, NULL) < 0) {
+    if (avformat_find_stream_info(*formatContext, NULL) < 0) {
         std::cerr << "Error: Couldn't find stream information." << std::endl;
         return -1;
     }
+    return 0;
+}
 
-    // ÕÒµ½ÊÓÆµÁ÷
+int main() {
+    // åˆå§‹åŒ– FFmpeg
+    av_register_all();
+    avformat_network_init();
+
+    const char* rtspurl = "rtsp://192.168.107.200:8554/stream";
+
+    AVFormatContext* formatContext = avformat_alloc_context();
+    if (open_rtsp_stream(&formatContext, rtspurl) != 0) {
+        return -1;
+    }
+
     int videoStream = -1;
     for (int i = 0; i < formatContext->nb_streams; i++) {
         if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -61,26 +80,15 @@ int main() {
         return -1;
     }
 
-    // ³õÊ¼»¯½âÂëÆ÷
     AVCodecParameters* codecParameters = formatContext->streams[videoStream]->codecpar;
     AVCodec* codec = avcodec_find_decoder(codecParameters->codec_id);
     AVCodecContext* codecContext = avcodec_alloc_context3(codec);
-    if (!codecContext) {
-        std::cerr << "Error: Couldn't allocate codec context." << std::endl;
+    if (!codecContext || avcodec_parameters_to_context(codecContext, codecParameters) < 0 || avcodec_open2(codecContext, codec, NULL) < 0) {
+        std::cerr << "Error: Couldn't initialize codec." << std::endl;
         return -1;
     }
 
-    if (avcodec_parameters_to_context(codecContext, codecParameters) < 0) {
-        std::cerr << "Error: Couldn't copy codec parameters to context." << std::endl;
-        return -1;
-    }
-
-    if (avcodec_open2(codecContext, codec, NULL) < 0) {
-        std::cerr << "Error: Couldn't open codec." << std::endl;
-        return -1;
-    }
-
-    // ³õÊ¼»¯ SDL2
+    // åˆå§‹åŒ– SDL2
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::cerr << "Error: Couldn't initialize SDL - " << SDL_GetError() << std::endl;
         return -1;
@@ -97,7 +105,6 @@ int main() {
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING,
         codecContext->width, codecContext->height);
 
-    // ´´½¨ SwsContext ÓÃÓÚ¸ñÊ½×ª»»
     SwsContext* swsContext = sws_getContext(codecContext->width, codecContext->height, codecContext->pix_fmt,
         codecContext->width, codecContext->height, AV_PIX_FMT_RGB24,
         SWS_BILINEAR, NULL, NULL, NULL);
@@ -109,72 +116,81 @@ int main() {
     av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, buffer, AV_PIX_FMT_RGB24, codecContext->width, codecContext->height, 1);
 
     AVPacket packet;
-    bool quit = false;
-    SDL_Event event;
 
-    // ´´½¨Ò»¸öÏß³ÌÓÃÓÚ½âÂë
+    // åˆ›å»ºè§£ç çº¿ç¨‹
     std::thread decodeThread([&]() {
         while (!quit) {
             if (av_read_frame(formatContext, &packet) >= 0) {
                 if (packet.stream_index == videoStream) {
-                    // ·¢ËÍÊı¾İ°üµ½½âÂëÆ÷
                     if (avcodec_send_packet(codecContext, &packet) == 0) {
                         while (avcodec_receive_frame(codecContext, frame) == 0) {
-                            std::lock_guard<std::mutex> lock(frameMutex);
-                            // ÏŞÖÆÖ¡¶ÓÁĞµÄ´óĞ¡
-                            if (frameQueue.size() >= MAX_FRAMES) {
+                            std::unique_lock<std::mutex> lock(frameMutex);
+                            if (!frameQueue.empty()) {
                                 cleanup_frame(frameQueue.front());
                                 frameQueue.pop_front();
                             }
-                            frameQueue.push_back(av_frame_clone(frame));  // ´æ´¢³É¹¦½âÂëµÄÖ¡
+                            frameQueue.push_back(av_frame_clone(frame));  // å­˜å‚¨æˆåŠŸè§£ç çš„å¸§
+                            frameReady = true;
+                            frameCondVar.notify_one();  // é€šçŸ¥æ¸²æŸ“çº¿ç¨‹
                         }
                     }
                 }
                 av_packet_unref(&packet);
             } else {
-                SDL_Delay(10);  // ÔİÍ£Ò»Ğ¡¶ÎÊ±¼ä
+                SDL_Delay(10);
+                std::cerr << "Warning: Error reading frame, attempting reconnection..." << std::endl;
+
+                // é‡è¿é€»è¾‘
+                avformat_close_input(&formatContext);
+                formatContext = avformat_alloc_context();
+                clear_frame_queue();  // æ¸…ç©ºå¸§é˜Ÿåˆ—
+                while (open_rtsp_stream(&formatContext, rtspurl) != 0) {
+                    std::cerr << "Reconnection failed, retrying in 5 seconds..." << std::endl;
+                    SDL_Delay(5000);  // ç­‰å¾…5ç§’å†é‡è¯•
+                }
+                std::cerr << "Reconnected successfully." << std::endl;
             }
         }
     });
 
+    SDL_Event event;
     while (!quit) {
-        // ´¦Àí SDL ÊÂ¼ş
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 quit = true;
             }
         }
 
-        std::lock_guard<std::mutex> lock(frameMutex);
-        if (!frameQueue.empty()) {
+        // ç­‰å¾…è§£ç çº¿ç¨‹è§£ç å‡ºä¸€å¸§
+        std::unique_lock<std::mutex> lock(frameMutex);
+        frameCondVar.wait(lock, [] { return frameReady || quit; });
+
+        if (!quit && !frameQueue.empty()) {
             AVFrame* currentFrame = frameQueue.front();
             frameQueue.pop_front();
 
-            // ½«½âÂëºóµÄÖ¡×ª»»Îª RGB ¸ñÊ½
+            // è½¬æ¢ä¸º RGB æ ¼å¼
             sws_scale(swsContext, currentFrame->data, currentFrame->linesize, 0, codecContext->height, rgbFrame->data, rgbFrame->linesize);
 
-            // ¸üĞÂ SDL ÎÆÀí
+            // æ›´æ–°çº¹ç†å¹¶æ˜¾ç¤º
             SDL_UpdateTexture(texture, NULL, rgbFrame->data[0], rgbFrame->linesize[0]);
-
-            // Çå³ıäÖÈ¾Æ÷²¢»æÖÆÎÆÀí
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, texture, NULL, NULL);
             SDL_RenderPresent(renderer);
 
-            cleanup_frame(currentFrame);  // ÇåÀíµ±Ç°Ö¡
-        } else {
-            SDL_Delay(10);  // ÔİÍ£Ò»Ğ¡¶ÎÊ±¼ä
+            cleanup_frame(currentFrame);
+            frameReady = false;  // é‡ç½®çŠ¶æ€
         }
     }
 
-    // ÊÍ·Å×ÊÔ´
+    // é‡Šæ”¾èµ„æº
     av_free(buffer);
     av_frame_free(&frame);
     av_frame_free(&rgbFrame);
     avcodec_free_context(&codecContext);
     avformat_close_input(&formatContext);
     sws_freeContext(swsContext);
-    decodeThread.join();  // µÈ´ı½âÂëÏß³Ì½áÊø
+    decodeThread.join();
 
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
